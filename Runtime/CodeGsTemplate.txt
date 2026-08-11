@@ -1,0 +1,316 @@
+var SCRIPT_VERSION = 'relational-2-read';
+
+var SPREADSHEET_ID = '';
+var SECRET = 'change_me';
+
+var TIMESTAMP_COLUMN = '_timestamp';
+var ID_COLUMN = '_id';
+var PARENT_COLUMN = '_parentId';
+var INDEX_COLUMN = '_index';
+
+var CHILD_SEPARATOR = '.';
+var SPLIT_SCALAR_ARRAYS = false;
+var ARRAY_DELIMITER = ', ';
+var MAX_ROWS_PER_TAB = 0;
+
+
+function doPost(e) {
+  var req;
+  try {
+    req = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return respond({ ok: false, error: 'bad json: ' + err });
+  }
+  return handle(req);
+}
+
+function doGet(e) {
+  var p = e.parameter || {};
+  if (p.mode === 'read') return read(p);
+
+  var row = {};
+  for (var k in p) {
+    if (k !== 'secret' && k !== 'sheet') row[k] = p[k];
+  }
+  return handle({ secret: p.secret, sheet: p.sheet, rows: [row] });
+}
+
+
+function handle(req) {
+  if (SECRET && req.secret !== SECRET) {
+    return respond({ ok: false, error: 'unauthorized' });
+  }
+
+  var rows = req.rows || [];
+  if (!rows.length) return respond({ ok: true, written: 0 });
+
+  var parentTab = req.sheet || 'Data';
+
+  var buckets = {};
+  var tabOrder = [];
+  for (var i = 0; i < rows.length; i++) {
+    decompose(rows[i], parentTab, null, -1, buckets, tabOrder);
+  }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return respond({ ok: false, error: 'busy' });
+
+  try {
+    var ss = SPREADSHEET_ID
+      ? SpreadsheetApp.openById(SPREADSHEET_ID)
+      : SpreadsheetApp.getActiveSpreadsheet();
+
+    var total = 0;
+    var written = {};
+
+    for (var t = 0; t < tabOrder.length; t++) {
+      var name = tabOrder[t];
+      var n = appendRows(ss, name, buckets[name]);
+      written[name] = n;
+      total += n;
+    }
+
+    return respond({ ok: true, written: total, sheets: written });
+  } catch (err) {
+    return respond({ ok: false, error: String(err) });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+// Splits one object into a row for its own tab plus child rows for each array.
+function decompose(obj, tabName, parentId, index, buckets, tabOrder) {
+  var id = obj[ID_COLUMN] || obj.id || newId();
+
+  var scalars = {};
+  var arrays = [];
+  collect(obj, '', scalars, arrays);
+
+  scalars[ID_COLUMN] = id;
+  if (parentId !== null) {
+    scalars[PARENT_COLUMN] = parentId;
+    scalars[INDEX_COLUMN] = index;
+  }
+
+  for (var a = 0; a < arrays.length; a++) {
+    var path = arrays[a].path;
+    var values = arrays[a].values;
+    if (values.length === 0) continue;
+
+    if (!SPLIT_SCALAR_ARRAYS && allScalar(values)) {
+      scalars[path] = joinCell(values);
+      continue;
+    }
+
+    var childTab = tabName + CHILD_SEPARATOR + path;
+    for (var e = 0; e < values.length; e++) {
+      var el = values[e];
+      var elObj = (el !== null && typeof el === 'object') ? el : { value: el };
+      decompose(elObj, childTab, id, e, buckets, tabOrder);
+    }
+  }
+
+  if (!buckets[tabName]) { buckets[tabName] = []; tabOrder.push(tabName); }
+  buckets[tabName].push(scalars);
+}
+
+
+function collect(obj, prefix, scalars, arrays) {
+  for (var key in obj) {
+    if (key === ID_COLUMN || key === 'id') continue;
+
+    var v = obj[key];
+    var name = prefix ? prefix + '.' + key : key;
+
+    if (v === null || v === undefined) {
+      scalars[name] = '';
+    } else if (Object.prototype.toString.call(v) === '[object Array]') {
+      arrays.push({ path: name, values: v });
+    } else if (typeof v === 'object') {
+      collect(v, name, scalars, arrays);
+    } else {
+      scalars[name] = v;
+    }
+  }
+}
+
+
+function appendRows(ss, sheetName, rows) {
+  if (!rows || !rows.length) return 0;
+
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) sheet = ss.insertSheet(sheetName);
+
+  var headers = readHeaders(sheet);
+
+  if (headers.length === 0) {
+    headers.push(ID_COLUMN);
+    if (rows[0][PARENT_COLUMN] !== undefined) {
+      headers.push(PARENT_COLUMN);
+      headers.push(INDEX_COLUMN);
+    }
+    if (TIMESTAMP_COLUMN) headers.push(TIMESTAMP_COLUMN);
+  } else if (TIMESTAMP_COLUMN && headers.indexOf(TIMESTAMP_COLUMN) === -1) {
+    headers.push(TIMESTAMP_COLUMN);
+  }
+
+  var added = false;
+  for (var r = 0; r < rows.length; r++) {
+    for (var key in rows[r]) {
+      if (headers.indexOf(key) === -1) { headers.push(key); added = true; }
+    }
+  }
+
+  if (added || sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+  }
+
+  var now = new Date();
+  var out = [];
+  for (var r2 = 0; r2 < rows.length; r2++) {
+    var line = [];
+    for (var c = 0; c < headers.length; c++) {
+      var h = headers[c];
+      if (h === TIMESTAMP_COLUMN) {
+        line.push(now);
+      } else {
+        var v = rows[r2][h];
+        line.push(v !== undefined && v !== null ? v : '');
+      }
+    }
+    out.push(line);
+  }
+
+  sheet.getRange(sheet.getLastRow() + 1, 1, out.length, headers.length).setValues(out);
+
+  if (MAX_ROWS_PER_TAB > 0) trim(sheet);
+
+  return out.length;
+}
+
+
+// GET ...exec?mode=read&secret=XYZ[&sheet=A,B]
+// Fixed shape so Unity's JsonUtility can parse it without a JSON library.
+function read(p) {
+  if (SECRET && p.secret !== SECRET) {
+    return respond({ ok: false, error: 'unauthorized' });
+  }
+
+  var ss = SPREADSHEET_ID
+    ? SpreadsheetApp.openById(SPREADSHEET_ID)
+    : SpreadsheetApp.getActiveSpreadsheet();
+
+  var wanted = null;
+  if (p.sheet) {
+    wanted = {};
+    var names = p.sheet.split(',');
+    for (var n = 0; n < names.length; n++) wanted[names[n].trim()] = true;
+  }
+
+  var sheets = ss.getSheets();
+  var tables = [];
+
+  for (var s = 0; s < sheets.length; s++) {
+    var sheet = sheets[s];
+    var name = sheet.getName();
+    if (wanted && !wanted[name]) continue;
+
+    var lastRow = sheet.getLastRow();
+    var lastCol = sheet.getLastColumn();
+    if (lastRow < 1 || lastCol < 1) continue;
+
+    var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+
+    var headers = [];
+    for (var c = 0; c < values[0].length; c++) {
+      headers.push(String(values[0][c]).trim());
+    }
+
+    var rows = [];
+    for (var r = 1; r < values.length; r++) {
+      var cells = [];
+      var empty = true;
+      for (var c2 = 0; c2 < headers.length; c2++) {
+        var v = values[r][c2];
+        if (v instanceof Date) v = v.toISOString();
+        var str = (v === null || v === undefined) ? '' : String(v);
+        if (str !== '') empty = false;
+        cells.push(str);
+      }
+      if (!empty) rows.push({ cells: cells });
+    }
+
+    tables.push({ name: name, columns: headers, rows: rows });
+  }
+
+  return respond({ ok: true, tables: tables });
+}
+
+
+// Timestamp + 8 random hex. Hyphens keep Sheets from parsing it as a number.
+function newId() {
+  var stamp = Utilities.formatDate(new Date(), 'UTC', 'yyyyMMdd-HHmmss');
+  var rand = Utilities.getUuid().replace(/-/g, '').substring(0, 8);
+  return stamp + '-' + rand;
+}
+
+function allScalar(values) {
+  for (var i = 0; i < values.length; i++) {
+    if (values[i] !== null && typeof values[i] === 'object') return false;
+  }
+  return true;
+}
+
+function joinCell(values) {
+  var parts = [];
+  for (var i = 0; i < values.length; i++) {
+    var s = (values[i] === null || values[i] === undefined) ? '' : String(values[i]);
+    if (s.indexOf(ARRAY_DELIMITER.trim()) !== -1 || s.indexOf('"') !== -1) {
+      s = '"' + s.replace(/"/g, '""') + '"';
+    }
+    parts.push(s);
+  }
+  return parts.join(ARRAY_DELIMITER);
+}
+
+function readHeaders(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (lastCol === 0 || sheet.getLastRow() === 0) return [];
+  var raw = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var headers = [];
+  for (var i = 0; i < raw.length; i++) {
+    var v = String(raw[i]).trim();
+    if (v) headers.push(v);
+  }
+  return headers;
+}
+
+function trim(sheet) {
+  var excess = (sheet.getLastRow() - 1) - MAX_ROWS_PER_TAB;
+  if (excess > 0) sheet.deleteRows(2, excess);
+}
+
+function respond(obj) {
+  obj.v = SCRIPT_VERSION;
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+function testWrite() {
+  var res = handle({
+    secret: SECRET,
+    sheet: 'Test',
+    rows: [{
+      Name: 'test',
+      pos: { x: 1, y: 2 },
+      tags: ['a', 'b', 'c'],
+      items: [{ label: 'one' }, { label: 'two' }]
+    }]
+  });
+  Logger.log(res.getContent());
+}

@@ -1,0 +1,14 @@
+{
+    "name": "com.tyradman.unity-googlesheets-connector",
+    "version": "1.0.0",
+    "displayName": "Unity Google Sheets Connector",
+    "description": "Sends JSON packages to a Google Sheet.",
+    "unity": "2021.3",
+    "unityRelease": "0f1",
+    "license": "MIT",
+    "keywords": [],
+    "author": {
+        "name": "Ty Radman"
+    },
+    "dependencies": {}
+}

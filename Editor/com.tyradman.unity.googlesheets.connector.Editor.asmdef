@@ -1,0 +1,15 @@
+{
+    "name": "com.tyradman.unity.googlesheets.connector.Editor",
+    "references": [
+        "com.tyradman.unity.googlesheets.connector.Runtime"
+    ],
+    "includePlatforms": ["Editor"],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
