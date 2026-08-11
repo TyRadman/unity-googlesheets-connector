@@ -2,7 +2,7 @@ using UnityEngine;
 
 namespace GoogleSheetsConnection
 {
-    [CreateAssetMenu(fileName = "SheetEndpoint", menuName = "Sheets/Endpoint")]
+    [CreateAssetMenu(fileName = "SheetEndpoint", menuName = "Google Sheets Connector/Endpoint")]
     public class SheetEndpoint : ScriptableObject
     {
         [Tooltip("Apps Script Web app URL. Paste it as-is; query strings are stripped automatically.")]
